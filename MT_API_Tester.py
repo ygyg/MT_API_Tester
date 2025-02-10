@@ -1,11 +1,26 @@
 # mt_api_tester.py
 #!/usr/bin/env python3
 
-import sys   
+import sys
+import os
+
+
+# When creating a Windows shortcut that uses WScript to launch a Python program while keeping the console visible, 
+# need to modify the Python script to handle the Windows GUI subsystem properly.
+# Add this at the very beginning of your script, before any other imports
+if sys.platform == 'win32':
+    import ctypes
+    # Ensure the console window is created when run with wscript.exe
+    # By allocating a console for this process
+    ctypes.windll.kernel32.AllocConsole()
+    # Redirect stdout/stderr to the console
+    sys.stdout = open('CONOUT$', 'w')
+    sys.stderr = open('CONOUT$', 'w')
+    
+    
 import asyncio
 import json
 import logging
-import os
 import pytz
 import re
 import threading
@@ -153,55 +168,6 @@ class AsyncWebsocketManager:
         self._cleanup_lock = threading.Lock()
         self._is_cleaning_up = False
 
-    async def connect(self):
-        """Establish WebSocket connection"""
-        try:
-            self.websocket = await websockets.connect(self.url)
-            self.running = True
-            self.on_connect()
-            await self.message_loop()
-        except Exception as e:
-            self.on_disconnect(str(e))
-        finally:
-            self.running = False
-
-    async def message_loop(self):
-        """Main message loop for sending and receiving messages"""
-        try:
-            while self.running and self.websocket:
-                # Handle sending messages
-                while not self.send_queue.empty() and self.running:
-                    message = self.send_queue.get()
-                    try:
-                        await self.websocket.send(message)
-                    except Exception as e:
-                        logging.error(f"Failed to send message: {e}")
-                    finally:
-                        self.send_queue.task_done()
-
-                # Handle receiving messages
-                try:
-                    message = await asyncio.wait_for(self.websocket.recv(), timeout=0.1)
-                    if message:
-                        self.on_message(message)
-                except asyncio.TimeoutError:
-                    continue
-                except websockets.exceptions.ConnectionClosed:
-                    break
-                except Exception as e:
-                    logging.error(f"Error in message loop: {e}")
-                    break
-
-        except Exception as e:
-            self.on_disconnect(str(e))
-        finally:
-            self.running = False
-            if self.websocket:
-                try:
-                    await self.websocket.close()
-                except Exception as e:
-                    logging.error(f"Error closing websocket: {e}")
-
     async def _cleanup_loop(self):
         """Clean up the event loop"""
         try:
@@ -225,17 +191,73 @@ class AsyncWebsocketManager:
         """Safely close the websocket connection"""
         if self.websocket:
             try:
-                # Check if websocket is already closed
-                if not self.websocket.closed:
-                    await self.websocket.close()
-                    # Wait briefly for close to complete
-                    await asyncio.sleep(0.1)
-            except websockets.exceptions.ConnectionClosed:
-                pass  # Already closed
+                logging.debug("Attempting to close websocket connection...")
+                await self.websocket.close()
+                logging.debug("Websocket connection closed successfully")
             except Exception as e:
-                logging.error(f"Error in _close_websocket: {e}")
+                import traceback
+                logging.error(f"Error closing websocket: {str(e)}\n{traceback.format_exc()}")
             finally:
                 self.websocket = None
+                logging.debug("Websocket reference cleared")
+
+    async def connect(self):
+        """Establish WebSocket connection"""
+        try:
+            self.websocket = await websockets.connect(self.url)
+            self.running = True
+            self.on_connect()
+            await self.message_loop()
+        except asyncio.CancelledError:
+            logging.debug("Connect operation cancelled")
+        except Exception as e:
+            self.on_disconnect(str(e))
+        finally:
+            self.running = False
+            if self.websocket:
+                try:
+                    await self.websocket.close()
+                except Exception:
+                    pass
+                self.websocket = None
+
+    async def message_loop(self):
+        """Main message loop for sending and receiving messages"""
+        try:
+            while self.running and self.websocket:
+                # Handle sending messages
+                while not self.send_queue.empty() and self.running:
+                    message = self.send_queue.get()
+                    try:
+                        await self.websocket.send(message)
+                    except Exception as e:
+                        logging.error(f"Failed to send message: {e}")
+                    finally:
+                        self.send_queue.task_done()
+
+                # Handle receiving messages with cancelation handling
+                if self.running:
+                    try:
+                        message = await asyncio.wait_for(self.websocket.recv(), timeout=0.1)
+                        if message:
+                            self.on_message(message)
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        logging.debug("Message loop cancelled")
+                        break
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+                    except Exception as e:
+                        logging.error(f"Error in message loop: {e}")
+                        break
+                else:
+                    break
+
+        except asyncio.CancelledError:
+            logging.debug("Message loop cancelled")
+        except Exception as e:
+            self.on_disconnect(str(e))
 
     def send_message(self, message):
         """Add message to send queue"""
@@ -263,74 +285,68 @@ class AsyncWebsocketManager:
         self.thread.start()
 
     def stop(self):
-        """Stop the WebSocket connection and clean up resources"""
-        with self._cleanup_lock:
-            if self._is_cleaning_up:
-                return
-            self._is_cleaning_up = True
-        
-        try:
-            # Signal stop
-            self.running = False
-            self._cleanup_event.set()
+        """Stop the WebSocket connection and clean up resources."""
+        if not self.running:
+            return
             
-            # Clear message queue
-            while not self.send_queue.empty():
+        try:
+            # Signal stop first
+            self.running = False
+            logging.debug("Stop signal set")
+            
+            if self.loop and not self.loop.is_closed():
                 try:
-                    self.send_queue.get_nowait()
-                    self.send_queue.task_done()
-                except Exception:
-                    break
-
-            if self.websocket:
-                if self.loop and self.loop.is_running():
-                    # If we have a running loop, use it for cleanup
-                    try:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            self._close_websocket(), 
+                    # Cancel all running tasks
+                    for task in asyncio.all_tasks(self.loop):
+                        task.cancel()
+                    logging.debug("All tasks cancelled")
+                    
+                    # Close websocket using the existing loop
+                    if self.websocket:
+                        asyncio.run_coroutine_threadsafe(
+                            self._close_websocket(),
                             self.loop
                         )
-                        # Wait with timeout for websocket to close
-                        fut.result(timeout=1.0)
-                    except Exception as e:
-                        logging.error(f"Error closing websocket in running loop: {e}")
-                else:
-                    # If no running loop, create a new one for cleanup
-                    temp_loop = asyncio.new_event_loop()
-                    try:
-                        temp_loop.run_until_complete(self._close_websocket())
-                    except Exception as e:
-                        logging.error(f"Error closing websocket in temp loop: {e}")
-                    finally:
-                        temp_loop.close()
-
-            # Stop the event loop if it's still running
-            if self.loop and self.loop.is_running():
-                try:
-                    self.loop.call_soon_threadsafe(self.loop.stop)
+                        logging.debug("Websocket close initiated")
+                        
                 except Exception as e:
-                    logging.error(f"Error stopping loop: {e}")
-
+                    import traceback
+                    logging.error(f"Error during task cancellation: {str(e)}\n{traceback.format_exc()}")
+            else:
+                # Create a new loop for cleanup if needed
+                try:
+                    cleanup_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(cleanup_loop)
+                    if self.websocket:
+                        cleanup_loop.run_until_complete(self._close_websocket())
+                    cleanup_loop.close()
+                    logging.debug("Cleanup with new loop completed")
+                except Exception as e:
+                    import traceback
+                    logging.error(f"Error during new loop cleanup: {str(e)}\n{traceback.format_exc()}")
+            
             # Wait for thread to finish with timeout
             if self.thread and self.thread.is_alive():
                 try:
                     self.thread.join(timeout=1.0)
+                    logging.debug("Thread join completed")
                 except Exception as e:
-                    logging.error(f"Error joining thread: {e}")
-
+                    import traceback
+                    logging.error(f"Error joining thread: {str(e)}\n{traceback.format_exc()}")
+            
             # Final cleanup
             self.websocket = None
             self.loop = None
             self.thread = None
-            
+            logging.debug("Final cleanup completed")
+                
         except Exception as e:
-            logging.error(f"Error during stop: {e}")
+            import traceback
+            logging.error(f"Error during stop: {str(e)}\n{traceback.format_exc()}")
         finally:
-            self._is_cleaning_up = False
-            self._cleanup_event.clear()
-            self.on_disconnect("Disconnected")  # Notify about disconnection
-
-            
+            # Notify about disconnection
+            self.on_disconnect("Disconnected")
+        
 class MedvedTraderAPIClient:
     """Main application class for MT API testing"""
     
@@ -339,63 +355,57 @@ class MedvedTraderAPIClient:
     def __init__(self, master):
         self.master = master
         
-        self.input_update_lock = False  # Initialize the lock flag
-        self.current_edit_frame = None  # Initialize current edit frame reference
-    
+        # Initialize core variables first
+        self.input_update_lock = False
+        self.current_edit_frame = None
         self._cleanup_lock = threading.Lock()
         self._is_cleaning_up = False
-        
-        # Set up paths first
-        self.app_data_path = self.get_app_data_path()
-        # Create directory if it doesn't exist
-        os.makedirs(self.app_data_path, exist_ok=True)     
-        
-        self.cache_file = os.path.join(self.app_data_path, "api_tester_cache.json")
-        
-        # Connection variables
         self.server_url = "ws://127.0.0.1:16400"
         self.is_authenticated = False
+        self.stored_text = [""] * 10
+        self.user_initiated_disconnect = False
         
-        # Set up styles
-        self.setup_styles()        
+        # Set up paths and load configuration early
+        self.app_data_path = self.get_app_data_path()
+        os.makedirs(self.app_data_path, exist_ok=True)
+        self.cache_file = os.path.join(self.app_data_path, "mt_api_tester_cache.json")
         
-        # Set up logging
-        self.response_text = scrolledtext.ScrolledText(
-            self.master, 
-            wrap=tk.WORD, 
-            width=80,
-            height=40
-        )
-        self.logger = self.setup_logger()        
-        
-        # Load configuration including password
+        # Load configuration which sets font_size
         self.load_config()
         
- 
+        # Set up styles after font_size is loaded
+        self.setup_styles()
         
-        # Load stored text and settings from cache
-        self.load_cache()
-
-
-
-        # UI elements initialization lists
+        # Initialize UI element lists
         self.input_frames = []
         self.input_fields = []
         self.send_buttons = []
-
+        
+        # Set up logging components
+        self.response_text = scrolledtext.ScrolledText(
+            self.master, 
+            wrap=tk.WORD,
+            width=80,
+            height=40,
+            font=('Courier', self.font_size)
+        )
+        self.logger = self.setup_logger()
+        
+        # Load cached data
+        self.load_cache()
         
         # Create UI elements
         self.create_widgets()
         
-        # WebSocket manager
+        # Initialize WebSocket manager
         self.ws_manager = AsyncWebsocketManager(
             self.server_url,
             self.on_message,
             self.on_connect,
             self.on_disconnect
         )
-
-        # Handle window closing
+        
+        # Set up window closing handler
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Setup autosave
@@ -708,8 +718,12 @@ class MedvedTraderAPIClient:
         paned.add(editor_frame, weight=1)  # Lower frame gets 1/3 of space
 
         # Create initial rows
-        for i in range(min(10, len(self.stored_text))):
-            self.create_input_row(self.stored_text[i])
+        for text in self.stored_text:
+            self.create_input_row(text)
+        
+        # Add an empty row if no stored requests
+        if not self.stored_text:
+            self.create_input_row("")
 
             
     def delete_row(self):
@@ -882,41 +896,36 @@ class MedvedTraderAPIClient:
                     # Load requests with validation
                     stored = data.get('requests', [])
                     if isinstance(stored, list) and all(isinstance(x, str) for x in stored):
-                        self.stored_text = (stored + [""] * 10)[:10]
+                        self.stored_text = stored
                     else:
-                        self.stored_text = [""] * 10
+                        self.stored_text = [""] * 10  # Default to 10 empty rows
                         
                     # Load settings
                     settings = data.get('settings', {})
                     if isinstance(settings, dict):
                         self.server_url = settings.get('server_url', self.server_url)
             else:
-                self.stored_text = [""] * 10
+                self.stored_text = [""] * 10  # Default to 10 empty rows
                 
         except Exception as e:
             self.log_error(f"Error loading cache: {e}")
-            self.stored_text = [""] * 10
+            self.stored_text = [""] * 10  # Default to 10 empty rows
             
     def load_config(self):
         """Load configuration from file"""
         config_file = self.get_config_path()
         
-        self.log_debug(f"Loading config from: {config_file}")
-        
         try:
             if os.path.exists(config_file):
-                self.log_debug("Config file exists, reading...")
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     self.mt_password = config.get('mt_password', '')
                     self.server_url = config.get('server_url', self.server_url)
-                    self.font_size = config.get('font_size', 10)  # Default font size is 10
-                    self.log_debug(f"Loaded config: server_url={self.server_url}, font_size={self.font_size}")
+                    self.font_size = config.get('font_size', 10)
             else:
-                self.log_debug("Config file does not exist, creating with defaults")
                 self.mt_password = ''
                 self.font_size = 10
-                self.save_config()  # Create initial config file
+                self.save_config()
                 
         except Exception as e:
             self.log_error(f"Error loading config: {e}")
@@ -1052,8 +1061,9 @@ class MedvedTraderAPIClient:
         self.master.after(100, self.send_connect_command)
 
     def on_disconnect(self, reason):
-        """Handle WebSocket disconnection"""
-        self.log_debug(f"Disconnected: {reason}")
+        """Handle WebSocket disconnection."""
+        if not self.user_initiated_disconnect:  # Only log if not user-initiated
+            self.log_debug(f"Disconnected: {reason}")
         self.is_authenticated = False
         self.master.after(0, lambda: self.connect_button.configure(text="Connect"))
 
@@ -1136,14 +1146,14 @@ class MedvedTraderAPIClient:
     def save_cache(self):
         """Save settings and requests to cache"""
         try:
-            # Get current text from all input fields
+            # Get current text from all input fields, including empty ones
             if hasattr(self, 'input_fields'):
-                self.stored_text = [field.get_json() for field in self.input_fields]
+                self.stored_text = [self.get_json_content(field) for field in self.input_fields]
             
             cache_data = {
                 'version': self.VERSION,
                 'last_modified': datetime.now().isoformat(),
-                'requests': self.stored_text,
+                'requests': self.stored_text,  # Save all rows, including empty ones
                 'settings': {
                     'server_url': self.server_url,
                 }
@@ -1210,7 +1220,7 @@ class MedvedTraderAPIClient:
         logger.addHandler(console_handler)
 
         # File handler - for full logging
-        file_handler = logging.FileHandler(os.path.join(self.app_data_path, "api_tester.log"))
+        file_handler = logging.FileHandler(os.path.join(self.app_data_path, "mt_api_tester.log"))
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
@@ -1314,7 +1324,7 @@ class MedvedTraderAPIClient:
 
 
     def start_connect(self):
-        """Handle connect/disconnect button click"""
+        """Handle connect/disconnect button click."""
         if self.connect_button["text"] == "Connect":
             self.connect_button["state"] = tk.DISABLED
             self.ws_manager.start()
@@ -1322,11 +1332,13 @@ class MedvedTraderAPIClient:
         else:
             self.connect_button["state"] = tk.DISABLED
             try:
+                self.user_initiated_disconnect = True  # Set flag before disconnecting
                 self.ws_manager.stop()
             finally:
                 self.connect_button["state"] = tk.NORMAL
                 self.connect_button.configure(text="Connect")
                 self.is_authenticated = False
+                self.user_initiated_disconnect = False  # Reset flag
 
     def update_font_size(self, new_size=None):
         """Update font size for all text widgets"""
